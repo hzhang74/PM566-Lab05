@@ -1,0 +1,197 @@
+---
+title: "Lab05"
+author: "Haoran Zhang"
+date: "2021/9/24"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+library(dtplyr)
+```
+
+## Setup
+dat
+```{r}
+# Download the data
+# Where are we getting the data from
+met_url <- "https://github.com/USCbiostats/data-science-data/raw/master/02_met/met_all.gz"
+# Downloading the data to a tempfile (so it is destroyed afterwards)
+# you can replace this with, for example, your own data:
+# tmp <- tempfile(fileext = ".gz")
+tmp <- "met.gz"
+# We sould be downloading this, ONLY IF this was not downloaded already.
+# otherwise is just a waste of time.
+if (!file.exists(tmp)) {
+  download.file(
+    url      = met_url,
+    destfile = tmp,
+    # method   = "libcurl", timeout = 1000 (you may need this option)
+  )
+}
+dat <- fread(tmp)
+head(dat)
+```
+stations
+```{r}
+stations <- fread("isd-history.csv")
+stations[, USAF := as.integer(USAF)]
+
+# Dealing with NAs and 999999
+stations[, USAF   := fifelse(USAF == 999999, NA_integer_, USAF)]
+stations[, CTRY   := fifelse(CTRY == "", NA_character_, CTRY)]
+stations[, STATE  := fifelse(STATE == "", NA_character_, STATE)]
+
+# Selecting the three relevant columns, and keeping unique records
+stations <- unique(stations[, list(USAF, CTRY, STATE)])
+
+# Dropping NAs
+stations <- stations[!is.na(USAF)]
+
+# Removing duplicates
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+
+```
+Merging the data
+```{r}
+met <- merge(
+  # Data
+  x     = dat,      
+  y     = stations, 
+  # List of variables to match
+  by.x  = "USAFID",
+  by.y  = "USAF", 
+  # Which obs to keep?
+  all.x = TRUE,      
+  all.y = FALSE
+  )
+```
+
+
+## Question 1: Representative station for the US
+```{r}
+station_averages<-met[,.(
+  temp=mean(temp,na.rm = TRUE),
+  wind.sp=mean(wind.sp,na.rm = TRUE),
+  atm.press=mean(atm.press,na.rm = TRUE),
+  lat=mean(lat,na.rm = TRUE),
+  lon=mean(lon,na.rm = TRUE)
+),by="USAFID"]
+```
+
+```{r}
+medians<-station_averages[,.(
+  temp_50=quantile(temp,probs = 0.5,na.rm = TRUE),
+  wind.sp_50=quantile(wind.sp,probs = 0.5,na.rm = TRUE),
+  atm.press_50=quantile(atm.press,probs = 0.5,na.rm = TRUE)
+)]
+medians
+```
+Find stations that are closest. (which.min())
+```{r median-temp}
+station_averages[,temp_dist:=abs(temp-medians$temp_50)]
+median_temp_station<-station_averages[order(temp_dist)][1]
+```
+The median temperature station is `r median_temp_station$USAFID`.
+
+## Question 2: Representative station per state
+First recover state variable by merging
+```{r}
+station_averages<-merge(x = station_averages, y = stations,by.x = "USAFID", by.y = "USAF", all.x = TRUE, all.y = FALSE)
+station_averages
+station_averages[, temp_50:=quantile(temp,probs = 0.5,na.rm = TRUE), by=STATE]
+station_averages[, wind.sp_50:=quantile(wind.sp,probs = 0.5,na.rm = TRUE), by=STATE]
+station_averages[, atm.press_50:=quantile(atm.press,probs = 0.5,na.rm = TRUE), by=STATE]
+
+station_averages
+```
+Euclidean $\sqrt{\sum_i(x_i-y_i)^2}$
+```{r}
+station_averages[,eudist:=sqrt(
+  (temp-temp_50)^2+(wind.sp-wind.sp_50)^2
+)]
+```
+
+Find representitive for each state
+```{r}
+rep_state <- station_averages[ , .SD[which.min(eudist)], by = STATE]
+rep_state
+```
+## Question 3: In the middle?
+```{r}
+midpoint <- met[, .(
+  lon_50 = quantile(lon, probs = 0.5, na.rm = TRUE),
+  lat_50 = quantile(lat, probs = 0.5, na.rm = TRUE)
+), by = STATE]
+
+station_averages <- merge(
+  x = station_averages,
+  y = midpoint,
+  by = "STATE"
+)
+```
+
+```{r}
+station_averages[, mid_eudist:= sqrt(
+  (lat - lat_50)^2+(lon - lon_50)^2
+)]
+station_averages
+```
+
+```{r}
+mid_state <- station_averages[ , .SD[which.min(mid_eudist)], by = STATE]
+mid_state
+```
+merge data of median and mid stations
+```{r}
+rep_state[, type := "median station"]
+mid_state[, type := "mid point"]
+all_stations <- rbind(rep_state, mid_state, fill = TRUE)
+```
+
+draw the map
+```{r}
+library(leaflet)
+pal <- colorFactor(c("red","blue"), domain = all_stations$type)
+leaflet() %>% 
+  addProviderTiles('CartoDB.Positron') %>% 
+  addCircles(
+    data = all_stations,
+    lat = ~lat, lng = ~lon, 
+    opacity = 1, fillOpacity = 1, radius = 400, color = ~pal(all_stations$type)
+    ) %>%
+  addLegend('bottomleft', pal=pal, values=all_stations$type,
+          title='Sites', opacity=1)
+```
+
+## Question 4: Means of means
+```{r}
+met[,state_temp:=mean(temp,na.rm = TRUE), by=STATE]
+met[, state_wind.sp := mean(wind.sp, na.rm = TRUE),by = STATE]
+met[, state_atm.press := mean(atm.press, na.rm = TRUE),by = STATE]
+met[,temp_cat:=fifelse(state_temp<20,"low-temp",
+                       fifelse(state_temp<25,"mid-temp",
+                               "high-temp"))]
+table(met$temp_cat,useNA = "always")
+```
+summarize
+```{r}
+tab <- met[, .(
+  N_entries = .N,
+  N_stations = length(unique(USAFID)),
+  avg_temp = mean(state_temp),
+  avg_wind.sp = mean(state_wind.sp),
+  avg_atm.press = mean(state_atm.press)
+), by = temp_cat]
+
+knitr::kable(tab)
+```
+
+
+
+
+
